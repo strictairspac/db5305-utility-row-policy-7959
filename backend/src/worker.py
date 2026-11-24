@@ -4,6 +4,7 @@ from threading import Event, Thread
 from time import sleep
 
 from src.config.settings import ARTIFACTS, cache, engine
+from src.services.checkpoints import LeaseLost, Store
 from src.services.domain import solve
 from src.services.workflow import claim, finish
 
@@ -29,14 +30,18 @@ def work():
             stop = Event()
             thread = Thread(target=heartbeat, args=(stop,), daemon=True)
             thread.start()
+            store = Store(run_id, token)
             try:
-                result = solve(payload, engine)
-                finish(run_id, token, result=result)
+                result = solve(payload, engine, store)
+                finish(run_id, token, result=result, store=store)
+            except LeaseLost:
+                # Another attempt took the run over; leave its rows untouched.
+                logging.warning('Lease lost for run %s; abandoning this attempt.', run_id)
             except (ValueError, KeyError, TypeError) as exc:
-                finish(run_id, token, error=str(exc)[:500])
+                finish(run_id, token, error=str(exc)[:500], store=store)
             except Exception:
                 logging.exception('Domain run failed: %s', run_id)
-                finish(run_id, token, error='后台执行失败，请检查输入或查看 worker 日志。')
+                finish(run_id, token, error='后台执行失败，请检查输入或查看 worker 日志。', store=store)
             finally:
                 stop.set()
                 thread.join()

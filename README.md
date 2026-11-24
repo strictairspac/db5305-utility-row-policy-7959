@@ -35,6 +35,8 @@ docker compose up -d --build --wait
 
 `SEED_DEMO=true` 启动时生成账号与一个业务样例。工作台新建档案会预填样例。可编辑表单中的数值、文本和结构化 JSON 后提交。业务说明中的原始文件是上游示例，演示数据通过表单录入。角色枚举位于后端 `src/constants/workflow.py` 与前端 `src/constants/workflow.js`。执行状态枚举也位于这两个文件，使用于队列、列表和执行详情。证据校验码是报告 JSON 按 UTF-8、键排序且省略多余空格序列化后的 SHA-256。
 
+验签按批次执行，每批最多 1000 组「人员 × 工单」；断点保存在 `business_run_batches`，中断后按输入指纹与批次计划续跑。证据按分区分页查阅，每页默认 100 行、最多 1000 行，翻页不改变存储的报告与校验码。实现位于 `backend/src/services/batching.py`、`checkpoints.py` 与 `paging.py`。
+
 ## 工程结构
 
 | 服务 | 实现 |

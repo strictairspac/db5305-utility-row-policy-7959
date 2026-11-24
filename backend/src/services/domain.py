@@ -1,7 +1,9 @@
 """Reconcile dispatch-approved meter work orders with observed PostgreSQL access."""
 
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime
 
+from . import batching
 from .row_security import read_visible_orders
 
 
@@ -76,6 +78,20 @@ SPEC = {
     },
 }
 
+SECTION_PEOPLE = "人员可见集"
+SECTION_DIFFERENCES = "差异清单"
+SECTION_MATRIX = "逐工单访问矩阵"
+
+
+@dataclass(frozen=True)
+class Context:
+    audit_at: datetime
+    operators: dict
+    orders: dict
+    delegations: list
+    expected: dict
+    normalized: dict
+
 
 def _records(payload, field, *columns):
     records = payload.get(field)
@@ -111,7 +127,7 @@ def _index(records, key):
     return index
 
 
-def _read_payload(payload):
+def read_payload(payload):
     if not isinstance(payload, dict):
         raise ValueError("验签输入须为对象。")
     audit_at = _time(payload.get("audit_at"), "验签时点")
@@ -139,32 +155,109 @@ def _read_payload(payload):
         if operator_id not in operators or order_id not in orders:
             raise ValueError(f"业务授权引用了未知人员或工单（{operator_id} / {order_id}）。")
         expected[operator_id].add(order_id)
-    return audit_at, operators, orders, delegations, expected
+
+    normalized = _normalize(audit_at, operators, orders, delegations, expected)
+    return Context(audit_at, operators, orders, delegations, expected, normalized)
+
+
+def _normalize(audit_at, operators, orders, delegations, expected):
+    """Order-independent semantic form; any change invalidates stored batches."""
+    people = [{"operator_id": key, "operator_name": value["operator_name"]}
+              for key, value in sorted(operators.items())]
+    work_orders = [{key: value[key] for key in ("order_id", "meter_id", "zone", "utility")}
+                   for _, value in sorted(orders.items())]
+    windows = sorted({
+        (row["operator_id"], row["zone"], row["utility"],
+         row["valid_from"].astimezone(UTC).isoformat(), row["valid_until"].astimezone(UTC).isoformat())
+        for row in delegations
+    })
+    grants = sorted((operator_id, order_id)
+                    for operator_id, order_ids in expected.items() for order_id in order_ids)
+    return {
+        "audit_at": audit_at.astimezone(UTC).isoformat(),
+        "operators": people,
+        "work_orders": work_orders,
+        "delegations": [dict(zip(("operator_id", "zone", "utility", "valid_from", "valid_until"), row))
+                        for row in windows],
+        "business_grants": [{"operator_id": operator_id, "order_id": order_id}
+                            for operator_id, order_id in grants],
+    }
 
 
 def validate(payload):
-    _read_payload(payload)
+    read_payload(payload)
 
 
-def solve(payload, engine):
-    audit_at, operators, orders, delegations, expected = _read_payload(payload)
-    readings = read_visible_orders(engine, audit_at, sorted(operators), orders.values(), delegations)
-    order_ids = sorted(orders)
+def _read_batch(context, batch, engine):
+    """Replay the restricted read for one bounded slice of pairs."""
+    batch_orders = [context.orders[order_id] for order_id in batch.order_ids]
+    batch_delegations = [row for row in context.delegations if row["operator_id"] in batch.operator_ids]
+    readings = read_visible_orders(
+        engine, context.audit_at, list(batch.operator_ids), batch_orders, batch_delegations)
+    known = set(context.orders)
+    return {
+        "roles": {operator_id: role for operator_id, (role, _) in readings.items()},
+        # A batch may only load a subset of the catalogue; keep known ids only.
+        "visible": {operator_id: sorted(seen & known)
+                    for operator_id, (_, seen) in readings.items()},
+    }
+
+
+def _merge(readings, batch, payload):
+    for operator_id in batch.operator_ids:
+        entry = readings.setdefault(operator_id, {"role": payload["roles"][operator_id], "visible": set()})
+        entry["visible"].update(payload["visible"].get(operator_id, ()))
+
+
+def _usable(payload, batch):
+    """A checkpoint is reusable only if it covers this batch's people."""
+    if not isinstance(payload, dict):
+        return False
+    roles = payload.get("roles")
+    visible = payload.get("visible")
+    if not isinstance(roles, dict) or not isinstance(visible, dict):
+        return False
+    return all(operator_id in roles and isinstance(visible.get(operator_id), list)
+               for operator_id in batch.operator_ids)
+
+
+def _read_batches(context, engine, store):
+    plan = batching.build(context.operators, context.orders)
+    fingerprint = batching.fingerprint(context.normalized)
+    plan_digest = batching.plan_digest(plan)
+    stored = {}
+    if store is not None:
+        stored = store.load(fingerprint, plan_digest, len(plan.batches))
+    readings = {}
+    for batch in plan.batches:
+        payload = stored.get(batch.index)
+        if not _usable(payload, batch):
+            # Missing, mismatched or corrupt checkpoint: recompute this batch.
+            payload = _read_batch(context, batch, engine)
+            if store is not None:
+                store.save(batch.index, fingerprint, plan_digest, payload)
+        _merge(readings, batch, payload)
+    return plan, fingerprint, readings
+
+
+def _build_rows(context, plan, readings):
     people, matrix, differences = [], [], []
     excess_count = missing_count = 0
-    for operator_id, (role, visible) in readings.items():
-        person = {"人员编号": operator_id, "姓名": operators[operator_id]["operator_name"]}
-        approved = expected[operator_id]
+    for operator_id in plan.operators:
+        observed = readings[operator_id]
+        person = {"人员编号": operator_id, "姓名": context.operators[operator_id]["operator_name"]}
+        approved = context.expected[operator_id]
+        visible = observed["visible"]
         excess, missing = visible - approved, approved - visible
         excess_count += len(excess)
         missing_count += len(missing)
         people.append({
-            **person, "数据库角色": role, "工单与委派 RLS 生效": "是",
+            **person, "数据库角色": observed["role"], "工单与委派 RLS 生效": "是",
             "业务授权工单": "、".join(sorted(approved)), "数据库可见工单": "、".join(sorted(visible)),
             "越权可见数": len(excess), "应见未见数": len(missing),
         })
-        for order_id in order_ids:
-            order = orders[order_id]
+        for order_id in plan.orders:
+            order = context.orders[order_id]
             if order_id in excess:
                 verdict = "越权可见"
             elif order_id in missing:
@@ -182,24 +275,61 @@ def solve(payload, engine):
             matrix.append(row)
             if order_id in excess or order_id in missing:
                 differences.append(row)
+    return people, matrix, differences, excess_count, missing_count
+
+
+def solve(payload, engine, store=None):
+    context = read_payload(payload)
+    plan, fingerprint, readings = _read_batches(context, engine, store)
+    people, matrix, differences, excess_count, missing_count = _build_rows(context, plan, readings)
 
     if differences:
         summary = f"验签发现 {excess_count} 组越权可见和 {missing_count} 组应见未见，请复核区域委派。"
-    elif not orders:
+    elif not plan.orders:
         summary = "本批没有抄表工单，已用受限角色验证空可见集。"
     else:
-        summary = f"验签通过，{len(operators)} 名人员的数据库可见集与派工授权一致。"
+        summary = f"验签通过，{len(plan.operators)} 名人员的数据库可见集与派工授权一致。"
     return {
         "summary": summary,
         "metrics": {
-            "验签人员数": len(operators), "核对组合数": len(matrix),
-            "业务授权数": sum(map(len, expected.values())),
-            "数据库可见数": sum(len(visible) for _, visible in readings.values()),
+            "验签人员数": len(plan.operators), "核对组合数": len(matrix),
+            "业务授权数": sum(map(len, context.expected.values())),
+            "数据库可见数": sum(len(entry["visible"]) for entry in readings.values()),
             "越权可见数": excess_count, "应见未见数": missing_count, "差异数": len(differences),
         },
+        "complete": True,
+        "plan": {
+            "version": batching.PLAN_VERSION, "max_pairs": batching.MAX_PAIRS,
+            "batch_count": len(plan.batches), "fingerprint": fingerprint,
+        },
         "sections": [
-            {"title": "人员可见集", "rows": people},
-            {"title": "差异清单", "rows": differences},
-            {"title": "逐工单访问矩阵", "rows": matrix},
+            {"title": SECTION_PEOPLE, "rows": people},
+            {"title": SECTION_DIFFERENCES, "rows": differences},
+            {"title": SECTION_MATRIX, "rows": matrix},
         ],
     }
+
+
+def report_complete(report):
+    """Signing is only allowed once every planned pair is present."""
+    if not isinstance(report, dict):
+        return False
+    metrics = report.get("metrics") if isinstance(report.get("metrics"), dict) else {}
+    sections = report.get("sections") if isinstance(report.get("sections"), list) else []
+    matrix = next((item.get("rows") for item in sections
+                   if isinstance(item, dict) and item.get("title") == SECTION_MATRIX), None)
+    if not isinstance(matrix, list):
+        return False
+    if metrics.get("核对组合数") != len(matrix):
+        return False
+    plan = report.get("plan")
+    if plan is None:
+        # Evidence produced before batching; its matrix was written in one go.
+        return True
+    if plan.get("version") != batching.PLAN_VERSION:
+        return False
+    if report.get("complete") is not True:
+        return False
+    batch_count = plan.get("batch_count")
+    max_pairs = plan.get("max_pairs", batching.MAX_PAIRS)
+    return isinstance(batch_count, int) and batch_count >= 0 and isinstance(max_pairs, int) and 0 < max_pairs <= batching.MAX_PAIRS
